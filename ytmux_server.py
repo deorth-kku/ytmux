@@ -6,6 +6,7 @@ import fcntl
 import logging
 import os
 import threading
+import urllib.parse
 
 import yt_dlp
 from aiohttp import web
@@ -27,6 +28,13 @@ DEFAULT_FORMAT = "webm"
 EMIT_CHUNK_SIZE = 256 * 1024
 # For webm, pyav doesn't need special flags. For mp4:
 # options={'movflags': 'frag_keyframe+empty_moov+default_base_moof'}
+
+
+def _sanitize_filename(name: str, fallback: str = "merged") -> str:
+    if name:
+        cleaned = "".join(c for c in name if c not in '<>:"/\\|?*' and ord(c) >= 32).strip()
+        return cleaned
+    return fallback
 
 
 def _safe_setattr(obj, name, value) -> None:
@@ -126,7 +134,7 @@ class StreamBuffer:
 # ── yt-dlp library interface ─────────────────────────────────────────────────
 
 def get_urls(youtube_url: str) -> dict[str, str]:
-    """Return {"video": url, "audio": url} for best quality video+audio."""
+    """Return media URLs and metadata for the selected YouTube formats."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -160,7 +168,15 @@ def get_urls(youtube_url: str) -> dict[str, str]:
         if "manifest_url" in audio_format:
             audio_url = _resolve_manifest(ydl, audio_url)
 
-        return {"video": video_url, "audio": audio_url}
+        title = info.get("title")
+        log.info("video name %s"%title)
+        return {
+            "video": video_url,
+            "audio": audio_url,
+            "title": title,
+            "filename": f"{_sanitize_filename(title)}.{DEFAULT_FORMAT}",
+            "webpage_url": info.get("webpage_url") or youtube_url,
+        }
 
 
 def _resolve_manifest(ydl: yt_dlp.YoutubeDL, manifest_url: str) -> str:
@@ -206,6 +222,7 @@ async def _stream_to_pipe(url: str, write_fd: int, stop_event: threading.Event,
 
 
 def generate_muxed_stream(video_url: str, audio_url: str,
+                          title: str | None = None,
                           output_format: str = DEFAULT_FORMAT,
                           stop_event: threading.Event | None = None):
     """Generator: yield muxed webm bytes in real-time.
@@ -303,6 +320,8 @@ def generate_muxed_stream(video_url: str, audio_url: str,
 
         # Create output container
         output = av.open(buf, mode="w", format=output_format)
+        if title:
+            output.metadata["title"] = title
         out_video = _add_remux_stream(output, video_stream)
         out_audio = _add_remux_stream(output, audio_stream)
 
@@ -378,13 +397,20 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
 
     log.info("streaming %s", url)
     urls = get_urls(url)
+    log.info("title: %s", urls["title"])
     log.info("video url: %s", urls["video"])
     log.info("audio url: %s", urls["audio"])
+
+    filename = urls["filename"]
+    quoted_filename = urllib.parse.quote(filename)
 
     resp = web.StreamResponse(
         headers={
             "Content-Type": f"video/{DEFAULT_FORMAT}",
-            "Content-Disposition": 'attachment; filename="merged.webm"',
+            "Content-Disposition": (
+                f'inline; filename="{filename}"; filename*=UTF-8\'\'{quoted_filename}'
+            ),
+            "Accept-Ranges": "none",
         },
     )
     await resp.prepare(request)
@@ -400,7 +426,12 @@ async def stream_handler(request: web.Request) -> web.StreamResponse:
 
     def run_mux():
         try:
-            for chunk in generate_muxed_stream(urls["video"], urls["audio"], stop_event=stop_event):
+            for chunk in generate_muxed_stream(
+                urls["video"],
+                urls["audio"],
+                title=urls["title"],
+                stop_event=stop_event,
+            ):
                 push_result(chunk)
         except Exception as e:
             error_holder.append(e)
@@ -448,7 +479,7 @@ async def info_handler(request: web.Request) -> web.Response:
         urls = get_urls(url)
     except RuntimeError as e:
         return web.Response(text=str(e), status=400)
-    log.info("info: video=%s audio=%s", urls["video"], urls["audio"])
+    log.info("info: title=%s video=%s audio=%s", urls["title"], urls["video"], urls["audio"])
     return web.json_response(urls)
 
 
