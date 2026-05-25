@@ -21,9 +21,10 @@ import yt_dlp
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ytmpd-server")
 
-# ── info cache ──────────────────────────────────────────────────────────────────
+# ── caches ──────────────────────────────────────────────────────────────────────
 
 _INFO_CACHE: dict[str, dict[str, Any]] = {}
+_PROBE_CACHE: dict[str, dict[str, Any]] = {}  # key: "{video_id}_{format_id}"
 
 
 def _parse_video_id(url: str) -> str:
@@ -87,12 +88,56 @@ def _get_or_fetch_info(youtube_url: str) -> dict[str, Any]:
 
 
 def _cleanup_expired() -> None:
-    """Remove expired entries from cache."""
+    """Remove expired entries from info cache."""
     now = int(time.time())
     expired = [vid for vid, info in _INFO_CACHE.items() if _min_expire(info) and _min_expire(info) <= now]
     for vid in expired:
         del _INFO_CACHE[vid]
         log.info("evicted expired cache for %s", vid)
+
+
+async def _probe_selected_formats(selected: dict[str, Any], video_id: str) -> dict[str, dict[str, Any]]:
+    timeout = aiohttp.ClientTimeout(total=30)
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+    }
+    probes: dict[str, dict[str, Any]] = {}
+    failed: list[str] = []
+
+    async def _do_probe(session: aiohttp.ClientSession, fmt: dict[str, Any]) -> dict[str, Any] | None:
+        cache_key = f"{video_id}_{fmt['format_id']}"
+        if cache_key in _PROBE_CACHE:
+            log.info("probe cache hit %s", fmt["format_id"])
+            return _PROBE_CACHE[cache_key]
+
+        if fmt.get("ext") not in ("mp4", "m4a", "webm"):
+            return None
+
+        for attempt in range(5):
+            try:
+                probe = await _fetch_mp4_probe(session, fmt["url"])
+                if probe:
+                    _PROBE_CACHE[cache_key] = probe
+                    log.info("probed format=%s ranges=%s", fmt["format_id"], probe)
+                return probe
+            except Exception as e:
+                log.warning("probe attempt %d failed format=%s: %s", attempt + 1, fmt["format_id"], e)
+        return None
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for stream_name in ("video", "audio"):
+            fmt = selected[stream_name]
+            probe = await _do_probe(session, fmt)
+            if probe:
+                probes[str(fmt["format_id"])] = probe
+            else:
+                failed.append(fmt["format_id"])
+
+    if failed:
+        raise RuntimeError(f"probe failed for formats: {', '.join(failed)}")
+
+    return probes
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
@@ -349,39 +394,6 @@ async def _fetch_mp4_probe(
     return result
 
 
-async def _probe_selected_formats(selected: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    timeout = aiohttp.ClientTimeout(total=30)
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-    }
-    probes: dict[str, dict[str, Any]] = {}
-    failed: list[str] = []
-
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        for stream_name in ("video", "audio"):
-            fmt = selected[stream_name]
-            if fmt.get("ext") not in ("mp4", "m4a", "webm"):
-                continue
-            probe = None
-            for attempt in range(5):
-                try:
-                    probe = await _fetch_mp4_probe(session, fmt["url"])
-                    break
-                except Exception as e:
-                    log.warning("probe attempt %d failed format=%s: %s", attempt + 1, fmt["format_id"], e)
-            if probe:
-                probes[str(fmt["format_id"])] = probe
-                log.info("probed format=%s ranges=%s", fmt["format_id"], probe)
-            else:
-                failed.append(fmt["format_id"])
-
-    if failed:
-        raise RuntimeError(f"probe failed for formats: {', '.join(failed)}")
-
-    return probes
-
-
 def _representation_element(
     parent: ET.Element,
     fmt: dict[str, Any],
@@ -492,17 +504,18 @@ def build_mpd(
     return ET.tostring(mpd, encoding="utf-8", xml_declaration=True)
 
 
-async def _resolve_info(request: web.Request) -> dict[str, Any]:
+async def _resolve_info(request: web.Request) -> tuple[dict[str, Any], str]:
     youtube_url = request.query.get("url")
     if not youtube_url:
         raise web.HTTPBadRequest(text="missing ?url=<youtube_url>")
-    return await asyncio.to_thread(_get_or_fetch_info, youtube_url)
+    info = await asyncio.to_thread(_get_or_fetch_info, youtube_url)
+    return info, _parse_video_id(youtube_url)
 
 
 async def info_handler(request: web.Request) -> web.Response:
-    info = await _resolve_info(request)
+    info, video_id = await _resolve_info(request)
     selected = _choose_av_pair(info)
-    probes = await _probe_selected_formats(selected)
+    probes = await _probe_selected_formats(selected, video_id)
     return web.json_response(
         {
             "title": info.get("title"),
@@ -526,9 +539,9 @@ async def info_handler(request: web.Request) -> web.Response:
 async def manifest_handler(request: web.Request) -> web.Response:
     log.info("GET /manifest %s", request.query.get("url"))
     try:
-        info = await _resolve_info(request)
+        info, video_id = await _resolve_info(request)
         selected = _choose_av_pair(info)
-        probes = await _probe_selected_formats(selected)
+        probes = await _probe_selected_formats(selected, video_id)
         mpd = build_mpd(info, selected, probes)
     except RuntimeError as e:
         log.error("manifest error: %s", e)
