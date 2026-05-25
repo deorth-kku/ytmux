@@ -5,12 +5,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import struct
 import xml.etree.ElementTree as ET
-from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -24,11 +22,6 @@ log = logging.getLogger("ytmpd-synth-poc")
 
 def _get_proxy() -> str | None:
     return os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-
-
-def _load_info_file(path: str | Path) -> dict[str, Any]:
-    with Path(path).open(encoding="utf-8") as f:
-        return json.load(f)
 
 
 def _extract_info(youtube_url: str) -> dict[str, Any]:
@@ -411,10 +404,6 @@ def build_mpd(
 
 
 async def _resolve_info(request: web.Request) -> dict[str, Any]:
-    fixed_info_path = request.app["info_file"]
-    if fixed_info_path:
-        return await asyncio.to_thread(_load_info_file, fixed_info_path)
-
     youtube_url = request.query.get("url")
     if not youtube_url:
         raise web.HTTPBadRequest(text="missing ?url=<youtube_url>")
@@ -513,58 +502,21 @@ async def asset_handler(request: web.Request) -> web.StreamResponse:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Synthesize a simple MPD from yt-dlp info.")
-    parser.add_argument("--info-file", help="Use a local yt-dlp info JSON instead of fetching from YouTube.")
-    parser.add_argument("--print-mpd", action="store_true", help="Print a sample MPD built from --info-file.")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8288", help="Base URL used with --print-mpd.")
     parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8288")))
     return parser
 
 
-def _fake_request(base_url: str) -> web.Request:
-    class _FakeURL:
-        def __init__(self, url: str):
-            self._url = url
-
-        def with_path(self, path: str) -> "_FakeURL":
-            from yarl import URL
-            return _FakeURL(str(URL(self._url).with_path(path).with_query(None)))
-
-        def with_query(self, query: dict[str, str]) -> str:
-            from yarl import URL
-            return str(URL(self._url).with_query(query))
-
-        def __str__(self) -> str:
-            return self._url
-
-    class _FakeRequest:
-        def __init__(self, url: str):
-            self.url = _FakeURL(url)
-
-    return _FakeRequest(base_url)  # type: ignore[return-value]
-
-
 def main() -> None:
     args = build_arg_parser().parse_args()
 
-    if args.print_mpd:
-        if not args.info_file:
-            raise SystemExit("--print-mpd requires --info-file")
-        info = _load_info_file(args.info_file)
-        selected = _choose_av_pair(info)
-        print(build_mpd(info, _fake_request(args.base_url), selected, {}).decode("utf-8"))
-        return
-
     app = web.Application()
-    app["info_file"] = args.info_file
     app.router.add_get("/info", info_handler)
     app.router.add_get("/manifest", manifest_handler)
     app.router.add_get("/play", play_handler)
     app.router.add_get("/asset", asset_handler)
 
     log.info("starting synthesized MPD POC on http://%s:%d", args.host, args.port)
-    if args.info_file:
-        log.info("using fixed info file: %s", args.info_file)
     web.run_app(app, host=args.host, port=args.port, access_log=None)
 
 
