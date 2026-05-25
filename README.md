@@ -38,6 +38,57 @@ python ytmux_stream.py &
 - `GET /?url=<yt_url>` — merged webm stream
 - `GET /info?url=<yt_url>` — JSON with video+audio URLs (no muxing)
 
+## M3U POC
+
+If VLC can play separate video/audio URLs directly on your device, you can skip muxing entirely:
+
+```bash
+python ytmux_m3u_poc.py 'https://youtu.be/VIDEO_ID'
+```
+
+That writes a local `.m3u` file containing:
+
+```text
+#EXTM3U
+#EXTINF:-1,<title>
+#EXTVLCOPT:input-slave=<audio_url>
+<video_url>
+```
+
+Then open that `.m3u` file in VLC.
+
+## DASH Proxy POC
+
+If VLC needs a server-hosted MPD, run:
+
+```bash
+python ytmpd_poc.py
+```
+
+Then point VLC at:
+
+```text
+http://<server>:8288/play?url=<youtube_url>&kind=dash
+```
+
+The server fetches YouTube's DASH manifest, rewrites media URLs to `/dash/asset`, and proxies segment requests back upstream.
+
+## Synthesized MPD POC
+
+If you want to build a static MPD from yt-dlp info instead of forwarding YouTube's manifest:
+
+```bash
+python ytmpd_synth_poc.py --info-file info.json
+```
+
+Or print the generated MPD directly:
+
+```bash
+python ytmpd_synth_poc.py --info-file info.json --print-mpd
+```
+
+This POC picks a compatible separate video/audio pair from the info JSON and emits a minimal MPD whose `BaseURL`s point at the local `/asset` proxy.
+
 ## Notes
 
 - `-c copy` avoids re-encoding; if codec/container mismatch, try `-c:v copy -c:a aac`

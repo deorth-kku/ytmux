@@ -40,5 +40,8 @@ Thumbs.db
 .env.*.local
 
 # Logs
-*.log
+#*.log
 logs/
+*.log
+
+*.json
