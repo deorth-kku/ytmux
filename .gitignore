@@ -43,5 +43,7 @@ Thumbs.db
 #*.log
 logs/
 *.log
+*.out
+
 
 *.json

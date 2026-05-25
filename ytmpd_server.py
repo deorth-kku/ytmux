@@ -126,9 +126,15 @@ async def _probe_selected_formats(selected: dict[str, Any], video_id: str) -> di
         return None
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        tasks = []
         for stream_name in ("video", "audio"):
             fmt = selected[stream_name]
-            probe = await _do_probe(session, fmt)
+            tasks.append(_do_probe(session, fmt))
+
+        results = await asyncio.gather(*tasks)
+
+        for stream_name, probe in zip(("video", "audio"), results):
+            fmt = selected[stream_name]
             if probe:
                 probes[str(fmt["format_id"])] = probe
             else:
