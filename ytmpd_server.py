@@ -17,7 +17,7 @@ import yt_dlp
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("ytmpd-synth-poc")
+log = logging.getLogger("ytmpd-server")
 
 
 def _get_proxy() -> str | None:
@@ -64,14 +64,19 @@ def _choose_av_pair(info: dict[str, Any]) -> dict[str, Any]:
 
     families = (
         (
-            "mp4",
+            "avc",
             lambda f: _is_video_only(f) and f.get("ext") == "mp4" and not str(f.get("vcodec") or "").startswith("av01"),
             lambda f: _is_audio_only(f) and f.get("ext") == "m4a" and str(f.get("acodec") or "").startswith("mp4a"),
         ),
         (
-            "webm",
+            "vp9",
             lambda f: _is_video_only(f) and f.get("ext") == "webm" and str(f.get("vcodec") or "").startswith("vp9"),
-            lambda f: _is_audio_only(f) and f.get("ext") == "webm" and "opus" in str(f.get("acodec") or ""),
+            lambda f: _is_audio_only(f) and f.get("ext") == "m4a" and str(f.get("acodec") or "").startswith("mp4a"),
+        ),
+        (
+            "vp9_mp4a",
+            lambda f: _is_video_only(f) and f.get("ext") == "mp4" and str(f.get("vcodec") or "").startswith("vp9"),
+            lambda f: _is_audio_only(f) and f.get("ext") == "m4a" and str(f.get("acodec") or "").startswith("mp4a"),
         ),
     )
 
@@ -89,7 +94,7 @@ def _choose_av_pair(info: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("Could not find separate video/audio formats in info")
 
     return {
-        "family": "mixed",
+        "family": "fallback",
         "video": max(videos, key=_video_score),
         "audio": max(audios, key=_audio_score),
     }
@@ -113,6 +118,8 @@ def _format_duration(seconds: float | int | None) -> str:
 
 def _mime_type(fmt: dict[str, Any]) -> str:
     if _is_video_only(fmt):
+        if str(fmt.get("vcodec") or "").startswith("av01"):
+            return "video/webm"
         return "video/mp4" if fmt.get("ext") == "mp4" else "video/webm"
     return "audio/mp4" if fmt.get("ext") == "m4a" else "audio/webm"
 
@@ -120,10 +127,6 @@ def _mime_type(fmt: dict[str, Any]) -> str:
 def _bandwidth(fmt: dict[str, Any]) -> str:
     tbr = fmt.get("tbr") or 0
     return str(max(1, int(float(tbr) * 1000)))
-
-
-def _asset_url(request: web.Request, target_url: str) -> str:
-    return str(request.url.with_path("/asset").with_query({"target": target_url}))
 
 
 def _parse_mp4_boxes(buf: bytes) -> list[dict[str, int | str]]:
@@ -275,23 +278,34 @@ async def _probe_selected_formats(selected: dict[str, Any]) -> dict[str, dict[st
         "Accept": "*/*",
     }
     probes: dict[str, dict[str, Any]] = {}
+    failed: list[str] = []
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         for stream_name in ("video", "audio"):
             fmt = selected[stream_name]
-            if fmt.get("ext") not in ("mp4", "m4a"):
+            if fmt.get("ext") not in ("mp4", "m4a", "webm"):
                 continue
-            probe = await _fetch_mp4_probe(session, fmt["url"])
+            probe = None
+            for attempt in range(5):
+                try:
+                    probe = await _fetch_mp4_probe(session, fmt["url"])
+                    break
+                except Exception as e:
+                    log.warning("probe attempt %d failed format=%s: %s", attempt + 1, fmt["format_id"], e)
             if probe:
                 probes[str(fmt["format_id"])] = probe
                 log.info("probed format=%s ranges=%s", fmt["format_id"], probe)
+            else:
+                failed.append(fmt["format_id"])
+
+    if failed:
+        raise RuntimeError(f"probe failed for formats: {', '.join(failed)}")
 
     return probes
 
 
 def _representation_element(
     parent: ET.Element,
-    request: web.Request,
     fmt: dict[str, Any],
     *,
     audio_lang: str | None = None,
@@ -315,7 +329,7 @@ def _representation_element(
         attrs["audioSamplingRate"] = str(fmt["asr"])
 
     representation = ET.SubElement(parent, "Representation", attrs)
-    ET.SubElement(representation, "BaseURL").text = _asset_url(request, fmt["url"])
+    ET.SubElement(representation, "BaseURL").text = fmt["url"]
     sidx_info = segment_probe.get("sidx") if segment_probe else None
 
     if sidx_info and sidx_info.get("segments"):
@@ -354,7 +368,6 @@ def _representation_element(
 
 def build_mpd(
     info: dict[str, Any],
-    request: web.Request,
     selected: dict[str, Any],
     probes: dict[str, dict[str, Any]],
 ) -> bytes:
@@ -385,13 +398,11 @@ def build_mpd(
 
     _representation_element(
         video_set,
-        request,
         video,
         segment_probe=probes.get(str(video["format_id"])),
     )
     _representation_element(
         audio_set,
-        request,
         audio,
         segment_probe=probes.get(str(audio["format_id"])),
     )
@@ -435,10 +446,18 @@ async def info_handler(request: web.Request) -> web.Response:
 
 
 async def manifest_handler(request: web.Request) -> web.Response:
-    info = await _resolve_info(request)
-    selected = _choose_av_pair(info)
-    probes = await _probe_selected_formats(selected)
-    mpd = build_mpd(info, request, selected, probes)
+    log.info("GET /manifest %s", request.query.get("url"))
+    try:
+        info = await _resolve_info(request)
+        selected = _choose_av_pair(info)
+        probes = await _probe_selected_formats(selected)
+        mpd = build_mpd(info, selected, probes)
+    except RuntimeError as e:
+        log.error("manifest error: %s", e)
+        return web.Response(text=str(e), status=502)
+    except Exception:
+        log.exception("manifest error")
+        return web.Response(text="Internal error", status=502)
     return web.Response(
         body=mpd,
         content_type="application/dash+xml",
@@ -452,52 +471,6 @@ async def manifest_handler(request: web.Request) -> web.Response:
 
 async def play_handler(request: web.Request) -> web.Response:
     raise web.HTTPFound(str(request.url.with_path("/manifest").with_query(request.query)))
-
-
-async def asset_handler(request: web.Request) -> web.StreamResponse:
-    target = request.query.get("target")
-    range_header = request.headers.get("Range")
-    log.info("GET /asset target=%s range=%s", target, range_header)
-    if not target:
-        return web.Response(text="missing ?target=<upstream_url>", status=400)
-
-    proxy = _get_proxy()
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-    }
-    if range_header:
-        headers["Range"] = range_header
-
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(target, proxy=proxy) as upstream:
-            if upstream.status >= 400:
-                text = await upstream.text()
-                return web.Response(
-                    text=text or f"upstream asset error: {upstream.status}",
-                    status=upstream.status,
-                )
-
-            resp = web.StreamResponse(status=upstream.status)
-            for name in (
-                "Content-Type",
-                "Content-Length",
-                "Content-Range",
-                "Accept-Ranges",
-                "ETag",
-                "Last-Modified",
-            ):
-                value = upstream.headers.get(name)
-                if value:
-                    resp.headers[name] = value
-            resp.headers["Cache-Control"] = "no-store"
-            await resp.prepare(request)
-
-            async for chunk in upstream.content.iter_chunked(64 * 1024):
-                await resp.write(chunk)
-            await resp.write_eof()
-            return resp
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -514,9 +487,8 @@ def main() -> None:
     app.router.add_get("/info", info_handler)
     app.router.add_get("/manifest", manifest_handler)
     app.router.add_get("/play", play_handler)
-    app.router.add_get("/asset", asset_handler)
 
-    log.info("starting synthesized MPD POC on http://%s:%d", args.host, args.port)
+    log.info("starting MPD server on http://%s:%d", args.host, args.port)
     web.run_app(app, host=args.host, port=args.port, access_log=None)
 
 
