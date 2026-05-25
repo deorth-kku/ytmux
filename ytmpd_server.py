@@ -7,7 +7,9 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import struct
+import time
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -18,6 +20,82 @@ import yt_dlp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ytmpd-server")
+
+# ── info cache ──────────────────────────────────────────────────────────────────
+
+_INFO_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _parse_video_id(url: str) -> str:
+    """Extract video ID from various YouTube URL formats."""
+    import urllib.parse as urlparse
+
+    parsed = urlparse.urlparse(url)
+    query = urlparse.parse_qs(parsed.query)
+
+    if "v" in query:
+        return query["v"][0]
+
+    # Match youtu.be/ID or youtube.com/embed/ID
+    path = parsed.path.strip("/")
+    segments = path.split("/")
+    if len(segments) >= 2 and segments[0] == "embed":
+        return segments[1]
+    if len(segments) == 1 and len(segments[0]) == 11:
+        return segments[0]
+
+    # Short URL redirect: https://youtu.be/ID
+    if parsed.hostname in ("youtu.be",):
+        return path.split("?")[0]
+
+    raise ValueError(f"unable to extract video ID from {url}")
+
+
+def _find_expire(url: str) -> int | None:
+    m = re.search(r"expire=(\d+)", url)
+    return int(m.group(1)) if m else None
+
+
+def _min_expire(info: dict[str, Any]) -> int | None:
+    expires: list[int] = []
+    for fmt in info.get("formats") or []:
+        u = fmt.get("url") or ""
+        e = _find_expire(u)
+        if e:
+            expires.append(e)
+    return min(expires) if expires else None
+
+
+def _get_or_fetch_info(youtube_url: str) -> dict[str, Any]:
+    """Return cached info if not expired, otherwise fetch and cache."""
+    video_id = _parse_video_id(youtube_url)
+    now = int(time.time())
+
+    if video_id in _INFO_CACHE:
+        cached = _INFO_CACHE[video_id]
+        if _min_expire(cached) and _min_expire(cached) > now:
+            log.info("cache hit %s", video_id)
+            return cached
+        else:
+            del _INFO_CACHE[video_id]
+
+    info = _extract_info(youtube_url)
+    exp = _min_expire(info)
+    _INFO_CACHE[video_id] = info
+    log.info("cached info for %s (expires=%s)", video_id, exp)
+    return info
+
+
+def _cleanup_expired() -> None:
+    """Remove expired entries from cache."""
+    now = int(time.time())
+    expired = [vid for vid, info in _INFO_CACHE.items() if _min_expire(info) and _min_expire(info) <= now]
+    for vid in expired:
+        del _INFO_CACHE[vid]
+        log.info("evicted expired cache for %s", vid)
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────────
 
 
 def _get_proxy() -> str | None:
@@ -418,7 +496,7 @@ async def _resolve_info(request: web.Request) -> dict[str, Any]:
     youtube_url = request.query.get("url")
     if not youtube_url:
         raise web.HTTPBadRequest(text="missing ?url=<youtube_url>")
-    return await asyncio.to_thread(_extract_info, youtube_url)
+    return await asyncio.to_thread(_get_or_fetch_info, youtube_url)
 
 
 async def info_handler(request: web.Request) -> web.Response:
@@ -489,6 +567,25 @@ def main() -> None:
     app.router.add_get("/play", play_handler)
 
     log.info("starting MPD server on http://%s:%d", args.host, args.port)
+
+    async def _periodic_cleanup(app):
+        while True:
+            now = time.time()
+            exps = [_min_expire(info) for info in _INFO_CACHE.values()]
+            exps = [e for e in exps if e]
+            if exps:
+                next_exp = min(exps)
+                sleep_secs = max(next_exp - now, 0)
+                log.debug("next cache expiry in %.0fs", sleep_secs)
+                await asyncio.sleep(sleep_secs)
+                _cleanup_expired()
+            else:
+                await asyncio.sleep(60)
+
+    async def _on_startup(app):
+        asyncio.create_task(_periodic_cleanup(app))
+
+    app.on_startup.append(_on_startup)
     web.run_app(app, host=args.host, port=args.port, access_log=None)
 
 
