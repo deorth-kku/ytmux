@@ -258,6 +258,44 @@ def _bandwidth(fmt: dict[str, Any]) -> str:
     return str(max(1, int(float(tbr) * 1000)))
 
 
+# ── subtitle helpers ──────────────────────────────────────────────────────────────
+
+
+def _pick_vtt_subtitles(info: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract one vtt subtitle track per language from automatic_captions."""
+    captions = info.get("automatic_captions") or {}
+    result: list[dict[str, Any]] = []
+
+    for lang, variants in captions.items():
+        for variant in variants:
+            if variant.get("ext") == "vtt":
+                result.append({
+                    "language": lang,
+                    "name": variant.get("name", lang),
+                    "url": variant["url"],
+                    "ext": "vtt",
+                })
+                break
+
+    return sorted(result, key=lambda s: s["language"])
+
+
+def _subtitles_element(parent: ET.Element, subtitles: list[dict[str, Any]]) -> None:
+    """Add one AdaptationSet per subtitle language, each with a Representation."""
+    for sub in subtitles:
+        text_set = ET.SubElement(parent, "AdaptationSet", {
+            "id": f"sub_{sub['language']}",
+            "contentType": "text",
+            "mimeType": "text/vtt",
+            "lang": sub["language"],
+        })
+        repr_elem = ET.SubElement(text_set, "Representation", {
+            "id": f"sub_{sub['language']}",
+            "bandwidth": "1000",
+        })
+        ET.SubElement(repr_elem, "BaseURL").text = sub["url"]
+
+
 def _parse_mp4_boxes(buf: bytes) -> list[dict[str, int | str]]:
     boxes: list[dict[str, int | str]] = []
     offset = 0
@@ -503,6 +541,9 @@ def build_mpd(
         segment_probe=probes.get(str(audio["format_id"])),
     )
 
+    subtitles = _pick_vtt_subtitles(info)
+    _subtitles_element(period, subtitles)
+
     comment = ET.Comment(
         f"selected family={selected['family']} video={video['format_id']} audio={audio['format_id']}"
     )
@@ -522,6 +563,7 @@ async def info_handler(request: web.Request) -> web.Response:
     info, video_id = await _resolve_info(request)
     selected = _choose_av_pair(info)
     probes = await _probe_selected_formats(selected, video_id)
+    subtitles = _pick_vtt_subtitles(info)
     return web.json_response(
         {
             "title": info.get("title"),
@@ -536,6 +578,7 @@ async def info_handler(request: web.Request) -> web.Response:
                 key: selected["audio"].get(key)
                 for key in ("format_id", "ext", "acodec", "asr", "audio_channels", "tbr", "filesize", "language", "url")
             },
+            "subtitles": subtitles,
             "probes": probes,
             "manifest_url": str(request.url.with_path("/manifest").with_query(request.query)),
         }
