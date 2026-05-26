@@ -477,8 +477,11 @@ def _representation_element(
         if segment_probe and segment_probe.get("init_range"):
             ET.SubElement(segment_list, "Initialization", {"range": segment_probe["init_range"]})
         timeline = ET.SubElement(segment_list, "SegmentTimeline")
-        for seg in sidx_info["segments"]:
-            ET.SubElement(timeline, "S", {"d": str(seg["duration"])})
+        for i, seg in enumerate(sidx_info["segments"]):
+            attrs = {"d": str(seg["duration"])}
+            if i == 0:
+                attrs["t"] = "0"
+            ET.SubElement(timeline, "S", attrs)
             ET.SubElement(
                 segment_list,
                 "SegmentURL",
