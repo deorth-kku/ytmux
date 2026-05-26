@@ -10,8 +10,8 @@ import os
 import re
 import struct
 import time
-import xml.etree.ElementTree as ET
 from typing import Any
+from xml.dom.minidom import Document, Element
 
 import aiohttp
 from aiohttp import web
@@ -285,22 +285,6 @@ def _pick_vtt_subtitles(info: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(result, key=lambda s: s["language"])
 
 
-def _subtitles_element(parent: ET.Element, subtitles: list[dict[str, Any]]) -> None:
-    """Add one AdaptationSet per subtitle language, each with a Representation."""
-    for sub in subtitles:
-        text_set = ET.SubElement(parent, "AdaptationSet", {
-            "id": f"sub_{sub['language']}",
-            "contentType": "text",
-            "mimeType": "text/vtt",
-            "lang": sub["language"],
-        })
-        repr_elem = ET.SubElement(text_set, "Representation", {
-            "id": f"sub_{sub['language']}",
-            "bandwidth": "1000",
-        })
-        ET.SubElement(repr_elem, "BaseURL").text = sub["url"]
-
-
 def _parse_mp4_boxes(buf: bytes) -> list[dict[str, int | str]]:
     boxes: list[dict[str, int | str]] = []
     offset = 0
@@ -443,69 +427,116 @@ async def _fetch_mp4_probe(
     return result
 
 
-def _representation_element(
-    parent: ET.Element,
+def _representation_to_dom(
+    doc: Document,
+    adaptation_set_node: Element,
     fmt: dict[str, Any],
     *,
     audio_lang: str | None = None,
     segment_probe: dict[str, Any] | None = None,
 ) -> None:
-    attrs = {
-        "id": str(fmt["format_id"]),
-        "mimeType": _mime_type(fmt),
-        "codecs": str(fmt.get("vcodec") if _is_video_only(fmt) else fmt.get("acodec")),
-        "bandwidth": _bandwidth(fmt),
-        "startWithSAP": "1",
-    }
+    vcodec = str(fmt.get("vcodec") if _is_video_only(fmt) else fmt.get("acodec"))
+    bandwidth = int(_bandwidth(fmt))
+
+    repr_node = doc.createElement("Representation")
+    repr_node.setAttribute("id", str(fmt["format_id"]))
+    repr_node.setAttribute("mimeType", _mime_type(fmt))
+    repr_node.setAttribute("codecs", vcodec)
+    repr_node.setAttribute("bandwidth", str(bandwidth))
+    repr_node.setAttribute("startWithSAP", "1")
     if fmt.get("width"):
-        attrs["width"] = str(fmt["width"])
+        repr_node.setAttribute("width", str(fmt["width"]))
     if fmt.get("height"):
-        attrs["height"] = str(fmt["height"])
+        repr_node.setAttribute("height", str(fmt["height"]))
     if fmt.get("fps"):
         fps = fmt["fps"]
-        attrs["frameRate"] = str(int(fps) if float(fps).is_integer() else fps)
+        repr_node.setAttribute("frameRate", str(int(fps) if float(fps).is_integer() else fps))
     if fmt.get("asr"):
-        attrs["audioSamplingRate"] = str(fmt["asr"])
+        repr_node.setAttribute("audioSamplingRate", str(fmt["asr"]))
 
-    representation = ET.SubElement(parent, "Representation", attrs)
-    ET.SubElement(representation, "BaseURL").text = fmt["url"]
+    base_url_node = doc.createElement("BaseURL")
+    base_url_node.appendChild(doc.createTextNode(fmt["url"]))
+    repr_node.appendChild(base_url_node)
+
     sidx_info = segment_probe.get("sidx") if segment_probe else None
-
     if sidx_info and sidx_info.get("segments"):
-        segment_list_attrs = {"timescale": str(sidx_info["timescale"])}
-        segment_list = ET.SubElement(representation, "SegmentList", segment_list_attrs)
+        segment_list_node = doc.createElement("SegmentList")
+        segment_list_node.setAttribute("timescale", str(sidx_info["timescale"]))
         if segment_probe and segment_probe.get("init_range"):
-            ET.SubElement(segment_list, "Initialization", {"range": segment_probe["init_range"]})
-        timeline = ET.SubElement(segment_list, "SegmentTimeline")
-        for i, seg in enumerate(sidx_info["segments"]):
-            attrs = {"d": str(seg["duration"])}
-            if i == 0:
-                attrs["t"] = "0"
-            ET.SubElement(timeline, "S", attrs)
-            ET.SubElement(
-                segment_list,
-                "SegmentURL",
-                {"mediaRange": f"{seg['range_start']}-{seg['range_end']}"},
-            )
+            init_node = doc.createElement("Initialization")
+            init_node.setAttribute("range", segment_probe["init_range"])
+            segment_list_node.appendChild(init_node)
+
+        sidx_segments = sidx_info["segments"]
+        if len(sidx_segments) == 1:
+            seg = sidx_segments[0]
+            s_node = doc.createElement("S")
+            s_node.setAttribute("d", str(int(seg["duration"])))
+            s_node.setAttribute("initializationSegmentIndex", "0")
+            s_node.setAttribute("index", "0")
+            segment_list_node.appendChild(s_node)
+            seg_url_node = doc.createElement("SegmentURL")
+            seg_url_node.setAttribute("mediaRange", f"{seg['range_start']}-{seg['range_end']}")
+            segment_list_node.appendChild(seg_url_node)
+        else:
+            timeline_node = doc.createElement("SegmentTimeline")
+            for i, seg in enumerate(sidx_segments):
+                s_node = doc.createElement("S")
+                s_node.setAttribute("d", str(int(seg["duration"])))
+                if i == 0:
+                    s_node.setAttribute("t", "0")
+                timeline_node.appendChild(s_node)
+            segment_list_node.appendChild(timeline_node)
+            for seg in sidx_segments:
+                seg_url_node = doc.createElement("SegmentURL")
+                seg_url_node.setAttribute("mediaRange", f"{seg['range_start']}-{seg['range_end']}")
+                segment_list_node.appendChild(seg_url_node)
+
+        repr_node.appendChild(segment_list_node)
     else:
-        segment_base_attrs: dict[str, str] = {}
+        segment_base_node = doc.createElement("SegmentBase")
         if segment_probe and segment_probe.get("index_range"):
-            segment_base_attrs["indexRange"] = segment_probe["index_range"]
-        segment_base = ET.SubElement(representation, "SegmentBase", segment_base_attrs)
+            segment_base_node.setAttribute("indexRange", segment_probe["index_range"])
         if segment_probe and segment_probe.get("init_range"):
-            ET.SubElement(segment_base, "Initialization", {"range": segment_probe["init_range"]})
+            init_node = doc.createElement("Initialization")
+            init_node.setAttribute("range", segment_probe["init_range"])
+            segment_base_node.appendChild(init_node)
+        repr_node.appendChild(segment_base_node)
 
     if _is_audio_only(fmt) and fmt.get("audio_channels"):
-        ET.SubElement(
-            representation,
-            "AudioChannelConfiguration",
-            {
-                "schemeIdUri": "urn:mpeg:dash:23003:3:audio_channel_configuration:2011",
-                "value": str(fmt["audio_channels"]),
-            },
-        )
+        ach_node = doc.createElement("AudioChannelConfiguration")
+        ach_node.setAttribute("schemeIdUri", "urn:mpeg:dash:23003:3:audio_channel_configuration:2011")
+        ach_node.setAttribute("value", str(fmt["audio_channels"]))
+        repr_node.appendChild(ach_node)
+
     if audio_lang:
-        representation.set("lang", audio_lang)
+        repr_node.setAttribute("lang", audio_lang)
+
+    adaptation_set_node.appendChild(repr_node)
+
+
+def _subtitles_to_dom(
+    doc: Document,
+    period_node: Element,
+    subtitles: list[dict[str, Any]],
+) -> None:
+    for sub in subtitles:
+        text_set_node = doc.createElement("AdaptationSet")
+        text_set_node.setAttribute("id", f"sub_{sub['language']}")
+        text_set_node.setAttribute("contentType", "text")
+        text_set_node.setAttribute("mimeType", "text/vtt")
+        text_set_node.setAttribute("lang", sub["language"])
+
+        repr_node = doc.createElement("Representation")
+        repr_node.setAttribute("id", f"sub_{sub['language']}")
+        repr_node.setAttribute("bandwidth", "1000")
+
+        base_url_node = doc.createElement("BaseURL")
+        base_url_node.appendChild(doc.createTextNode(sub["url"]))
+        repr_node.appendChild(base_url_node)
+
+        text_set_node.appendChild(repr_node)
+        period_node.appendChild(text_set_node)
 
 
 def build_mpd(
@@ -517,46 +548,64 @@ def build_mpd(
     audio = selected["audio"]
     duration = _format_duration(info.get("duration"))
 
-    mpd = ET.Element(
-        "MPD",
-        {
-            "xmlns": "urn:mpeg:dash:schema:mpd:2011",
-            "type": "static",
-            "profiles": "urn:mpeg:dash:profile:full:2011",
-            "mediaPresentationDuration": duration,
-            "minBufferTime": "PT1.5S",
-        },
-    )
+    doc = Document()
+    mpd_node = doc.createElement("MPD")
+    mpd_node.setAttribute("xmlns", "urn:mpeg:dash:schema:mpd:2011")
+    mpd_node.setAttribute("type", "static")
+    mpd_node.setAttribute("profiles", "urn:mpeg:dash:profile:full:2011")
+    mpd_node.setAttribute("mediaPresentationDuration", duration)
+    mpd_node.setAttribute("minBufferTime", "PT1.5S")
 
-    program_info = ET.SubElement(mpd, "ProgramInformation")
-    ET.SubElement(program_info, "Title").text = info.get("title") or "untitled"
+    program_info_node = doc.createElement("ProgramInformation")
+    title_node = doc.createElement("Title")
+    title_node.appendChild(doc.createTextNode(info.get("title") or "untitled"))
+    program_info_node.appendChild(title_node)
+    mpd_node.appendChild(program_info_node)
 
-    period = ET.SubElement(mpd, "Period", {"id": "p0", "start": "PT0S", "duration": duration})
-    video_set = ET.SubElement(period, "AdaptationSet", {"id": "video", "contentType": "video"})
-    audio_attrs = {"id": "audio", "contentType": "audio"}
-    if audio.get("language"):
-        audio_attrs["lang"] = str(audio["language"])
-    audio_set = ET.SubElement(period, "AdaptationSet", audio_attrs)
+    period_node = doc.createElement("Period")
+    period_node.setAttribute("id", "p0")
+    period_node.setAttribute("start", "PT0S")
+    period_node.setAttribute("duration", duration)
 
-    _representation_element(
-        video_set,
+    # video AdaptationSet
+    video_set_node = doc.createElement("AdaptationSet")
+    video_set_node.setAttribute("id", "video")
+    video_set_node.setAttribute("contentType", "video")
+    _representation_to_dom(
+        doc,
+        video_set_node,
         video,
         segment_probe=probes.get(str(video["format_id"])),
     )
-    _representation_element(
-        audio_set,
+    period_node.appendChild(video_set_node)
+
+    # audio AdaptationSet
+    audio_set_node = doc.createElement("AdaptationSet")
+    audio_set_node.setAttribute("id", "audio")
+    audio_set_node.setAttribute("contentType", "audio")
+    if audio.get("language"):
+        audio_set_node.setAttribute("lang", str(audio["language"]))
+    _representation_to_dom(
+        doc,
+        audio_set_node,
         audio,
         segment_probe=probes.get(str(audio["format_id"])),
     )
+    period_node.appendChild(audio_set_node)
 
+    # subtitles
     subtitles = _pick_vtt_subtitles(info)
-    _subtitles_element(period, subtitles)
+    _subtitles_to_dom(doc, period_node, subtitles)
 
-    comment = ET.Comment(
+    # comment
+    comment_node = doc.createComment(
         f"selected family={selected['family']} video={video['format_id']} audio={audio['format_id']}"
     )
-    mpd.insert(0, comment)
-    return ET.tostring(mpd, encoding="utf-8", xml_declaration=True)
+    mpd_node.appendChild(comment_node)
+
+    mpd_node.appendChild(period_node)
+    doc.appendChild(mpd_node)
+    return doc.toprettyxml(indent="    ", encoding="utf-8")
 
 
 async def _resolve_info(request: web.Request) -> tuple[dict[str, Any], str]:
