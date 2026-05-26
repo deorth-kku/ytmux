@@ -262,6 +262,8 @@ def _bandwidth(fmt: dict[str, Any]) -> str:
 
 
 def _pick_vtt_subtitles(info: dict[str, Any]) -> list[dict[str, Any]]:
+    # subtitles crash vlc for some reason
+    return {}
     """Extract one vtt subtitle track per language from manually uploaded subtitles.
     Fallback to automatic_captions if no manual subtitles exist."""
     # Prefer manually uploaded subtitles (not auto-generated)
