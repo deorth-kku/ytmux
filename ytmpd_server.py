@@ -266,10 +266,6 @@ def _pick_vtt_subtitles(info: dict[str, Any]) -> list[dict[str, Any]]:
     Fallback to automatic_captions if no manual subtitles exist."""
     # Prefer manually uploaded subtitles (not auto-generated)
     subtitles = info.get("subtitles") or {}
-    if not subtitles:
-        # Fall back to auto-generated
-        subtitles = info.get("automatic_captions") or {}
-
     result: list[dict[str, Any]] = []
     for lang, variants in subtitles.items():
         for variant in variants:
@@ -480,12 +476,13 @@ def _representation_to_dom(
             segment_list_node.appendChild(seg_url_node)
         else:
             timeline_node = doc.createElement("SegmentTimeline")
-            for i, seg in enumerate(sidx_segments):
+            current_t = 0
+            for seg in sidx_segments:
                 s_node = doc.createElement("S")
                 s_node.setAttribute("d", str(int(seg["duration"])))
-                if i == 0:
-                    s_node.setAttribute("t", "0")
+                s_node.setAttribute("t", str(current_t))
                 timeline_node.appendChild(s_node)
+                current_t += seg["duration"]
             segment_list_node.appendChild(timeline_node)
             for seg in sidx_segments:
                 seg_url_node = doc.createElement("SegmentURL")
