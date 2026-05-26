@@ -118,6 +118,10 @@ async def _probe_selected_formats(selected: dict[str, Any], video_id: str) -> di
             try:
                 probe = await _fetch_mp4_probe(session, fmt["url"])
                 if probe:
+                    if fmt.get("duration"):
+                        probe["duration"] = float(fmt["duration"])
+                    elif fmt.get("filesize") and fmt.get("tbr"):
+                        probe["duration"] = max(0.1, (float(fmt["filesize"]) * 8.0) / (float(fmt["tbr"]) * 1000.0))
                     _PROBE_CACHE[cache_key] = probe
                     log.info("probed format=%s ranges=%s", fmt["format_id"], probe)
                 return probe
@@ -396,7 +400,7 @@ async def _fetch_mp4_probe(
     url: str,
     *,
     probe_bytes: int = 512 * 1024,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     headers = {"Range": f"bytes=0-{probe_bytes - 1}"}
     proxy = _get_proxy()
 
@@ -460,36 +464,20 @@ def _representation_to_dom(
     if sidx_info and sidx_info.get("segments"):
         segment_list_node = doc.createElement("SegmentList")
         segment_list_node.setAttribute("timescale", str(sidx_info["timescale"]))
+        if segment_probe and segment_probe.get("duration"):
+            duration_seconds = float(segment_probe["duration"])
+            total_ticks = max(1, int(round(duration_seconds * int(sidx_info["timescale"])) ))
+            avg_ticks = max(1, int(round(total_ticks / len(sidx_info["segments"]))))
+            segment_list_node.setAttribute("duration", str(avg_ticks))
         if segment_probe and segment_probe.get("init_range"):
             init_node = doc.createElement("Initialization")
             init_node.setAttribute("range", segment_probe["init_range"])
             segment_list_node.appendChild(init_node)
 
-        sidx_segments = sidx_info["segments"]
-        if len(sidx_segments) == 1:
-            seg = sidx_segments[0]
-            s_node = doc.createElement("S")
-            s_node.setAttribute("d", str(int(seg["duration"])))
-            s_node.setAttribute("initializationSegmentIndex", "0")
-            s_node.setAttribute("index", "0")
-            segment_list_node.appendChild(s_node)
+        for seg in sidx_info["segments"]:
             seg_url_node = doc.createElement("SegmentURL")
             seg_url_node.setAttribute("mediaRange", f"{seg['range_start']}-{seg['range_end']}")
             segment_list_node.appendChild(seg_url_node)
-        else:
-            timeline_node = doc.createElement("SegmentTimeline")
-            current_t = 0
-            for seg in sidx_segments:
-                s_node = doc.createElement("S")
-                s_node.setAttribute("d", str(int(seg["duration"])))
-                s_node.setAttribute("t", str(current_t))
-                timeline_node.appendChild(s_node)
-                current_t += seg["duration"]
-            segment_list_node.appendChild(timeline_node)
-            for seg in sidx_segments:
-                seg_url_node = doc.createElement("SegmentURL")
-                seg_url_node.setAttribute("mediaRange", f"{seg['range_start']}-{seg['range_end']}")
-                segment_list_node.appendChild(seg_url_node)
 
         repr_node.appendChild(segment_list_node)
     else:
