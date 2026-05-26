@@ -262,11 +262,16 @@ def _bandwidth(fmt: dict[str, Any]) -> str:
 
 
 def _pick_vtt_subtitles(info: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract one vtt subtitle track per language from automatic_captions."""
-    captions = info.get("automatic_captions") or {}
-    result: list[dict[str, Any]] = []
+    """Extract one vtt subtitle track per language from manually uploaded subtitles.
+    Fallback to automatic_captions if no manual subtitles exist."""
+    # Prefer manually uploaded subtitles (not auto-generated)
+    subtitles = info.get("subtitles") or {}
+    if not subtitles:
+        # Fall back to auto-generated
+        subtitles = info.get("automatic_captions") or {}
 
-    for lang, variants in captions.items():
+    result: list[dict[str, Any]] = []
+    for lang, variants in subtitles.items():
         for variant in variants:
             if variant.get("ext") == "vtt":
                 result.append({
