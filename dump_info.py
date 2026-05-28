@@ -5,7 +5,7 @@ import json
 import sys
 import yt_dlp
 
-url = sys.argv[1] if len(sys.argv) > 1 else "https://youtu.be/SbX7bgzRLAQ"
+url = sys.argv[1] if len(sys.argv) > 1 else "https://www.youtube.com/watch?v=W6pryqt1dwY"
 
 ydl_opts = {
     "quiet": True,

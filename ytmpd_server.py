@@ -26,6 +26,22 @@ log = logging.getLogger("ytmpd-server")
 _INFO_CACHE: dict[str, dict[str, Any]] = {}
 _PROBE_CACHE: dict[str, dict[str, Any]] = {}  # key: "{video_id}_{format_id}"
 
+_VIDEO_FAMILY_ALIASES: dict[str, str] = {
+    "avc": "avc",
+    "h264": "avc",
+    "mp4": "avc",
+    "vp9": "vp9",
+    "av1": "av1",
+}
+
+_AUDIO_FAMILY_ALIASES: dict[str, str] = {
+    "aac": "aac",
+    "m4a": "aac",
+    "mp4a": "aac",
+    "opus": "opus",
+    "webm": "opus",
+}
+
 
 def _parse_video_id(url: str) -> str:
     """Extract video ID from various YouTube URL formats."""
@@ -74,7 +90,8 @@ def _get_or_fetch_info(youtube_url: str) -> dict[str, Any]:
 
     if video_id in _INFO_CACHE:
         cached = _INFO_CACHE[video_id]
-        if _min_expire(cached) and _min_expire(cached) > now:
+        cached_expire = _min_expire(cached)
+        if cached_expire and cached_expire > now:
             log.info("cache hit %s", video_id)
             return cached
         else:
@@ -90,7 +107,11 @@ def _get_or_fetch_info(youtube_url: str) -> dict[str, Any]:
 def _cleanup_expired() -> None:
     """Remove expired entries from info cache."""
     now = int(time.time())
-    expired = [vid for vid, info in _INFO_CACHE.items() if _min_expire(info) and _min_expire(info) <= now]
+    expired = []
+    for vid, info in _INFO_CACHE.items():
+        expire = _min_expire(info)
+        if expire and expire <= now:
+            expired.append(vid)
     for vid in expired:
         del _INFO_CACHE[vid]
         log.info("evicted expired cache for %s", vid)
@@ -111,12 +132,16 @@ async def _probe_selected_formats(selected: dict[str, Any], video_id: str) -> di
             log.info("probe cache hit %s", fmt["format_id"])
             return _PROBE_CACHE[cache_key]
 
-        if fmt.get("ext") not in ("mp4", "m4a", "webm"):
+        ext = str(fmt.get("ext") or "")
+        if ext not in ("mp4", "m4a", "webm"):
             return None
 
         for attempt in range(5):
             try:
-                probe = await _fetch_mp4_probe(session, fmt["url"])
+                if ext == "webm":
+                    probe = await _fetch_webm_probe(session, fmt["url"])
+                else:
+                    probe = await _fetch_mp4_probe(session, fmt["url"])
                 if probe:
                     if fmt.get("duration"):
                         probe["duration"] = float(fmt["duration"])
@@ -124,9 +149,25 @@ async def _probe_selected_formats(selected: dict[str, Any], video_id: str) -> di
                         probe["duration"] = max(0.1, (float(fmt["filesize"]) * 8.0) / (float(fmt["tbr"]) * 1000.0))
                     _PROBE_CACHE[cache_key] = probe
                     log.info("probed format=%s ranges=%s", fmt["format_id"], probe)
+                else:
+                    log.warning(
+                        "probe attempt %d returned no probe format=%s ext=%s url=%s",
+                        attempt + 1,
+                        fmt["format_id"],
+                        ext,
+                        fmt["url"],
+                    )
                 return probe
             except Exception as e:
-                log.warning("probe attempt %d failed format=%s: %s", attempt + 1, fmt["format_id"], e)
+                log.warning(
+                    "probe attempt %d failed format=%s ext=%s error_type=%s error=%r",
+                    attempt + 1,
+                    fmt["format_id"],
+                    ext,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
         return None
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -142,7 +183,7 @@ async def _probe_selected_formats(selected: dict[str, Any], video_id: str) -> di
             if probe:
                 probes[str(fmt["format_id"])] = probe
             else:
-                failed.append(fmt["format_id"])
+                failed.append(str(fmt["format_id"]))
 
     if failed:
         raise RuntimeError(f"probe failed for formats: {', '.join(failed)}")
@@ -192,45 +233,130 @@ def _audio_score(fmt: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _choose_av_pair(info: dict[str, Any]) -> dict[str, Any]:
+def _canonical_video_family(value: str | None) -> str:
+    if not value:
+        return "avc"
+    family = _VIDEO_FAMILY_ALIASES.get(value.lower())
+    if not family:
+        raise web.HTTPBadRequest(text="invalid ?video= value; expected avc|vp9|av1 or ?video_format_id=")
+    return family
+
+
+def _canonical_audio_family(value: str | None) -> str:
+    if not value:
+        return "aac"
+    family = _AUDIO_FAMILY_ALIASES.get(value.lower())
+    if not family:
+        raise web.HTTPBadRequest(text="invalid ?audio= value; expected aac|opus or ?audio_format_id=")
+    return family
+
+
+def _matches_video_family(fmt: dict[str, Any], family: str) -> bool:
+    if not _is_video_only(fmt):
+        return False
+    vcodec = str(fmt.get("vcodec") or "")
+    ext = str(fmt.get("ext") or "")
+    if family == "avc":
+        return ext == "mp4" and vcodec.startswith("avc1")
+    if family == "vp9":
+        return ext == "webm" and vcodec.startswith("vp9")
+    if family == "av1":
+        return ext == "webm" and vcodec.startswith("av01")
+    return False
+
+
+def _matches_audio_family(fmt: dict[str, Any], family: str) -> bool:
+    if not _is_audio_only(fmt):
+        return False
+    acodec = str(fmt.get("acodec") or "")
+    ext = str(fmt.get("ext") or "")
+    if family == "aac":
+        return ext == "m4a" and acodec.startswith("mp4a")
+    if family == "opus":
+        return ext == "webm" and acodec.startswith("opus")
+    return False
+
+
+def _find_format_by_id(info: dict[str, Any], format_id: str) -> dict[str, Any] | None:
+    for fmt in info.get("formats") or []:
+        if str(fmt.get("format_id")) == format_id:
+            return fmt
+    return None
+
+
+def _choose_best_format(formats: list[dict[str, Any]], *, kind: str) -> dict[str, Any]:
+    if not formats:
+        raise RuntimeError(f"Could not find separate {kind} formats in info")
+    if kind == "video":
+        return max(formats, key=_video_score)
+    return max(formats, key=_audio_score)
+
+
+def _list_selectable_formats(info: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    video_formats = []
+    audio_formats = []
+    for fmt in info.get("formats") or []:
+        if _is_video_only(fmt) and str(fmt.get("ext") or "") in ("mp4", "webm"):
+            video_formats.append(
+                {
+                    "format_id": fmt.get("format_id"),
+                    "ext": fmt.get("ext"),
+                    "vcodec": fmt.get("vcodec"),
+                    "width": fmt.get("width"),
+                    "height": fmt.get("height"),
+                    "fps": fmt.get("fps"),
+                    "tbr": fmt.get("tbr"),
+                }
+            )
+        if _is_audio_only(fmt) and str(fmt.get("ext") or "") in ("m4a", "webm"):
+            audio_formats.append(
+                {
+                    "format_id": fmt.get("format_id"),
+                    "ext": fmt.get("ext"),
+                    "acodec": fmt.get("acodec"),
+                    "asr": fmt.get("asr"),
+                    "audio_channels": fmt.get("audio_channels"),
+                    "tbr": fmt.get("tbr"),
+                    "language": fmt.get("language"),
+                }
+            )
+    video_formats.sort(key=lambda f: (f.get("height") or 0, f.get("fps") or 0, f.get("tbr") or 0), reverse=True)
+    audio_formats.sort(key=lambda f: (f.get("asr") or 0, f.get("audio_channels") or 0, f.get("tbr") or 0), reverse=True)
+    return {"video": video_formats, "audio": audio_formats}
+
+
+def _choose_av_pair(
+    info: dict[str, Any],
+    *,
+    video_selector: str | None = None,
+    audio_selector: str | None = None,
+    video_format_id: str | None = None,
+    audio_format_id: str | None = None,
+) -> dict[str, Any]:
     formats = info.get("formats") or []
 
-    families = (
-        (
-            "avc",
-            lambda f: _is_video_only(f) and f.get("ext") == "mp4" and not str(f.get("vcodec") or "").startswith("av01"),
-            lambda f: _is_audio_only(f) and f.get("ext") == "m4a" and str(f.get("acodec") or "").startswith("mp4a"),
-        ),
-        (
-            "vp9",
-            lambda f: _is_video_only(f) and f.get("ext") == "webm" and str(f.get("vcodec") or "").startswith("vp9"),
-            lambda f: _is_audio_only(f) and f.get("ext") == "m4a" and str(f.get("acodec") or "").startswith("mp4a"),
-        ),
-        (
-            "vp9_mp4a",
-            lambda f: _is_video_only(f) and f.get("ext") == "mp4" and str(f.get("vcodec") or "").startswith("vp9"),
-            lambda f: _is_audio_only(f) and f.get("ext") == "m4a" and str(f.get("acodec") or "").startswith("mp4a"),
-        ),
-    )
+    if video_format_id:
+        video = _find_format_by_id(info, video_format_id)
+        if not video or not _is_video_only(video):
+            raise web.HTTPBadRequest(text=f"unknown or non-video ?video_format_id={video_format_id}")
+        selected_video_family = str(video.get("vcodec") or "custom")
+    else:
+        video_family = _canonical_video_family(video_selector)
+        video = _choose_best_format([fmt for fmt in formats if _matches_video_family(fmt, video_family)], kind="video")
+        selected_video_family = video_family
 
-    for family, video_pred, audio_pred in families:
-        videos = [fmt for fmt in formats if video_pred(fmt)]
-        audios = [fmt for fmt in formats if audio_pred(fmt)]
-        if videos and audios:
-            video = max(videos, key=_video_score)
-            audio = max(audios, key=_audio_score)
-            return {"family": family, "video": video, "audio": audio}
+    if audio_format_id:
+        audio = _find_format_by_id(info, audio_format_id)
+        if not audio or not _is_audio_only(audio):
+            raise web.HTTPBadRequest(text=f"unknown or non-audio ?audio_format_id={audio_format_id}")
+        selected_audio_family = str(audio.get("acodec") or "custom")
+    else:
+        audio_family = _canonical_audio_family(audio_selector)
+        audio = _choose_best_format([fmt for fmt in formats if _matches_audio_family(fmt, audio_family)], kind="audio")
+        selected_audio_family = audio_family
 
-    videos = [fmt for fmt in formats if _is_video_only(fmt)]
-    audios = [fmt for fmt in formats if _is_audio_only(fmt)]
-    if not videos or not audios:
-        raise RuntimeError("Could not find separate video/audio formats in info")
-
-    return {
-        "family": "fallback",
-        "video": max(videos, key=_video_score),
-        "audio": max(audios, key=_audio_score),
-    }
+    family = f"{selected_video_family}+{selected_audio_family}"
+    return {"family": family, "video": video, "audio": audio}
 
 
 def _format_duration(seconds: float | int | None) -> str:
@@ -267,7 +393,7 @@ def _bandwidth(fmt: dict[str, Any]) -> str:
 
 def _pick_vtt_subtitles(info: dict[str, Any]) -> list[dict[str, Any]]:
     # subtitles crash vlc for some reason
-    return {}
+    return []
     """Extract one vtt subtitle track per language from manually uploaded subtitles.
     Fallback to automatic_captions if no manual subtitles exist."""
     # Prefer manually uploaded subtitles (not auto-generated)
@@ -420,13 +546,329 @@ async def _fetch_mp4_probe(
 
     sidx = next((box for box in boxes if box["type"] == "sidx"), None)
     init_range = f"0-{moov['end']}"
-    result: dict[str, Any] = {"init_range": init_range}
+    result: dict[str, Any] = {"init_range": init_range, "container": "mp4"}
     if sidx:
         result["index_range"] = f"{sidx['start']}-{sidx['end']}"
         sidx_info = _parse_sidx(body, int(sidx["start"]), int(sidx["size"]))
         if sidx_info:
             result["sidx"] = sidx_info
     return result
+
+
+def _ebml_width(first_byte: int) -> int:
+    mask = 0x80
+    width = 1
+    while width <= 8 and not (first_byte & mask):
+        mask >>= 1
+        width += 1
+    if width > 8:
+        raise ValueError("invalid EBML vint")
+    return width
+
+
+def _read_ebml_id(buf: bytes, offset: int) -> tuple[int, int]:
+    if offset >= len(buf):
+        raise ValueError("missing EBML id")
+    width = _ebml_width(buf[offset])
+    end = offset + width
+    if end > len(buf):
+        raise ValueError("truncated EBML id")
+    value = 0
+    for b in buf[offset:end]:
+        value = (value << 8) | b
+    return value, width
+
+
+def _read_ebml_size(buf: bytes, offset: int) -> tuple[int | None, int]:
+    if offset >= len(buf):
+        raise ValueError("missing EBML size")
+    width = _ebml_width(buf[offset])
+    end = offset + width
+    if end > len(buf):
+        raise ValueError("truncated EBML size")
+    value = buf[offset] & ((1 << (8 - width)) - 1)
+    for b in buf[offset + 1:end]:
+        value = (value << 8) | b
+    max_value = (1 << (7 * width)) - 1
+    if value == max_value:
+        return None, width
+    return value, width
+
+
+def _read_ebml_uint(buf: bytes, start: int, size: int) -> int:
+    end = start + size
+    if end > len(buf):
+        raise ValueError("truncated EBML uint")
+    value = 0
+    for b in buf[start:end]:
+        value = (value << 8) | b
+    return value
+
+
+def _iter_ebml_elements(buf: bytes, start: int, end: int, *, absolute_base: int = 0):
+    pos = start
+    limit = min(end, len(buf))
+    while pos < limit:
+        try:
+            elem_id, id_width = _read_ebml_id(buf, pos)
+            size, size_width = _read_ebml_size(buf, pos + id_width)
+        except ValueError:
+            break
+        data_start = pos + id_width + size_width
+        truncated = False
+        if size is None:
+            data_end = limit
+            next_pos = limit
+            truncated = True
+        else:
+            full_data_end = data_start + size
+            if full_data_end > limit:
+                data_end = limit
+                next_pos = limit
+                truncated = True
+            else:
+                data_end = full_data_end
+                next_pos = full_data_end
+        yield {
+            "id": elem_id,
+            "header_start": absolute_base + pos,
+            "data_start": absolute_base + data_start,
+            "data_end": absolute_base + data_end,
+            "size": None if size is None else int(size),
+            "local_data_start": data_start,
+            "local_data_end": data_end,
+            "truncated": truncated,
+        }
+        pos = next_pos
+
+
+def _parse_webm_init_metadata(buf: bytes, absolute_base: int = 0) -> dict[str, int] | None:
+    segment = next((elem for elem in _iter_ebml_elements(buf, 0, len(buf), absolute_base=absolute_base) if elem["id"] == 0x18538067), None)
+    if not segment:
+        return None
+
+    segment_data_start = int(segment["data_start"])
+    segment_local_start = int(segment["local_data_start"])
+    segment_local_end = int(segment["local_data_end"])
+    first_cluster_start: int | None = None
+    timecode_scale = 1_000_000
+    duration_ns: int | None = None
+
+    for elem in _iter_ebml_elements(buf, segment_local_start, segment_local_end, absolute_base=absolute_base):
+        elem_id = int(elem["id"])
+        if elem_id == 0x1549A966:
+            for info_elem in _iter_ebml_elements(buf, int(elem["local_data_start"]), int(elem["local_data_end"]), absolute_base=absolute_base):
+                if int(info_elem["id"]) == 0x2AD7B1:
+                    timecode_scale = _read_ebml_uint(buf, int(info_elem["local_data_start"]), int(info_elem["size"] or 0))
+                elif int(info_elem["id"]) == 0x4489:
+                    raw = buf[int(info_elem["local_data_start"]):int(info_elem["local_data_end"])]
+                    if len(raw) == 4:
+                        duration_ns = int(struct.unpack('>f', raw)[0] * timecode_scale)
+                    elif len(raw) == 8:
+                        duration_ns = int(struct.unpack('>d', raw)[0] * timecode_scale)
+        elif elem_id == 0x1F43B675 and first_cluster_start is None:
+            first_cluster_start = int(elem["header_start"])
+            break
+
+    if first_cluster_start is None:
+        return None
+
+    result = {
+        "segment_data_start": segment_data_start,
+        "first_cluster_start": first_cluster_start,
+        "timecode_scale": timecode_scale,
+    }
+    if duration_ns is not None:
+        result["duration_ns"] = duration_ns
+    return result
+
+
+def _parse_webm_cues(buf: bytes, absolute_base: int = 0) -> list[dict[str, int]]:
+    cue_points: list[dict[str, int]] = []
+    cues_elements = []
+
+    segment = next((elem for elem in _iter_ebml_elements(buf, 0, len(buf), absolute_base=absolute_base) if elem["id"] == 0x18538067), None)
+    if segment:
+        cues_elements.extend(
+            elem
+            for elem in _iter_ebml_elements(buf, int(segment["local_data_start"]), int(segment["local_data_end"]), absolute_base=absolute_base)
+            if int(elem["id"]) == 0x1C53BB6B
+        )
+    else:
+        cues_elements.extend(
+            elem
+            for elem in _iter_ebml_elements(buf, 0, len(buf), absolute_base=absolute_base)
+            if int(elem["id"]) == 0x1C53BB6B
+        )
+
+    for elem in cues_elements:
+        for cue_point in _iter_ebml_elements(buf, int(elem["local_data_start"]), int(elem["local_data_end"]), absolute_base=absolute_base):
+            if int(cue_point["id"]) != 0xBB:
+                continue
+            cue_time: int | None = None
+            cluster_position: int | None = None
+            for cue_elem in _iter_ebml_elements(buf, int(cue_point["local_data_start"]), int(cue_point["local_data_end"]), absolute_base=absolute_base):
+                cue_elem_id = int(cue_elem["id"])
+                if cue_elem_id == 0xB3:
+                    cue_time = _read_ebml_uint(buf, int(cue_elem["local_data_start"]), int(cue_elem["size"] or 0))
+                elif cue_elem_id == 0xB7:
+                    current_track: int | None = None
+                    current_cluster_position: int | None = None
+                    for pos_elem in _iter_ebml_elements(buf, int(cue_elem["local_data_start"]), int(cue_elem["local_data_end"]), absolute_base=absolute_base):
+                        pos_elem_id = int(pos_elem["id"])
+                        if pos_elem_id == 0xF7:
+                            current_track = _read_ebml_uint(buf, int(pos_elem["local_data_start"]), int(pos_elem["size"] or 0))
+                        elif pos_elem_id == 0xF1:
+                            current_cluster_position = _read_ebml_uint(buf, int(pos_elem["local_data_start"]), int(pos_elem["size"] or 0))
+                    if current_cluster_position is not None and (current_track in (None, 1)):
+                        cluster_position = current_cluster_position
+            if cue_time is not None and cluster_position is not None:
+                cue_points.append({"time": cue_time, "cluster_position": cluster_position})
+    cue_points.sort(key=lambda item: item["cluster_position"])
+    return cue_points
+
+
+def _build_webm_probe(init_meta: dict[str, int], cue_points: list[dict[str, int]], content_length: int | None) -> dict[str, Any] | None:
+    if not cue_points or content_length is None:
+        return None
+
+    segment_data_start = init_meta["segment_data_start"]
+    first_cluster_start = init_meta["first_cluster_start"]
+    timecode_scale = init_meta["timecode_scale"]
+    duration_ns = init_meta.get("duration_ns")
+
+    cluster_starts = [segment_data_start + item["cluster_position"] for item in cue_points]
+    segments: list[dict[str, int]] = []
+    for idx, start in enumerate(cluster_starts):
+        end = cluster_starts[idx + 1] - 1 if idx < len(cluster_starts) - 1 else content_length - 1
+        segment_info = {
+            "range_start": start,
+            "range_end": end,
+            "time": cue_points[idx]["time"],
+        }
+        if idx < len(cue_points) - 1:
+            segment_info["duration"] = cue_points[idx + 1]["time"] - cue_points[idx]["time"]
+        elif duration_ns is not None:
+            duration_in_scale = max(0, int(round(duration_ns / timecode_scale)) - cue_points[idx]["time"])
+            if duration_in_scale > 0:
+                segment_info["duration"] = duration_in_scale
+        segments.append(segment_info)
+
+    return {
+        "container": "webm",
+        "timescale": 1000,
+        "timecode_scale": timecode_scale,
+        "duration_ns": duration_ns,
+        "init_range": f"0-{first_cluster_start - 1}",
+        "segments": segments,
+    }
+
+
+async def _fetch_content_length(session: aiohttp.ClientSession, url: str) -> int | None:
+    proxy = _get_proxy()
+    async with session.head(url, proxy=proxy) as resp:
+        content_length = resp.headers.get("Content-Length")
+        log.info(
+            "webm probe HEAD url=%s final_url=%s status=%s content_length=%s content_range=%s",
+            url,
+            resp.url,
+            resp.status,
+            content_length,
+            resp.headers.get("Content-Range"),
+        )
+        if resp.status >= 400:
+            return None
+        return int(content_length) if content_length and content_length.isdigit() else None
+
+
+async def _fetch_webm_probe(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    front_probe_bytes: int = 2 * 1024 * 1024,
+    tail_probe_bytes: int = 2 * 1024 * 1024,
+) -> dict[str, Any] | None:
+    proxy = _get_proxy()
+    content_length = await _fetch_content_length(session, url)
+    log.info(
+        "webm probe start url=%s content_length=%s front_probe_bytes=%s tail_probe_bytes=%s",
+        url,
+        content_length,
+        front_probe_bytes,
+        tail_probe_bytes,
+    )
+
+    async with session.get(url, proxy=proxy, headers={"Range": f"bytes=0-{front_probe_bytes - 1}"}) as resp:
+        if resp.status >= 400:
+            text = await resp.text()
+            raise RuntimeError(text or f"webm probe request failed: {resp.status}")
+        front = await resp.read()
+        log.info(
+            "webm probe front GET url=%s final_url=%s status=%s content_length=%s content_range=%s first32=%s",
+            url,
+            resp.url,
+            resp.status,
+            resp.headers.get("Content-Length"),
+            resp.headers.get("Content-Range"),
+            front[:32].hex(),
+        )
+    log.info("webm probe front bytes=%s url=%s", len(front), url)
+
+    init_meta = _parse_webm_init_metadata(front, 0)
+    if not init_meta:
+        log.warning("webm probe missing init metadata from front chunk url=%s front_bytes=%s", url, len(front))
+        return None
+    log.info("webm probe init metadata url=%s init_meta=%s", url, init_meta)
+
+    cue_points = _parse_webm_cues(front, 0)
+    log.info("webm probe front cues url=%s cue_count=%s", url, len(cue_points))
+    if cue_points:
+        probe = _build_webm_probe(init_meta, cue_points, content_length)
+        if probe:
+            log.info("webm probe built from front cues url=%s segment_count=%s", url, len(probe.get("segments") or []))
+            return probe
+        log.warning("webm probe front cues found but probe build returned none url=%s content_length=%s", url, content_length)
+
+    if content_length and content_length > tail_probe_bytes:
+        start = max(0, content_length - tail_probe_bytes)
+        async with session.get(url, proxy=proxy, headers={"Range": f"bytes={start}-{content_length - 1}"}) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise RuntimeError(text or f"webm tail probe request failed: {resp.status}")
+            tail = await resp.read()
+            log.info(
+                "webm probe tail GET url=%s final_url=%s status=%s content_length=%s content_range=%s first32=%s",
+                url,
+                resp.url,
+                resp.status,
+                resp.headers.get("Content-Length"),
+                resp.headers.get("Content-Range"),
+                tail[:32].hex(),
+            )
+        log.info("webm probe tail bytes=%s start=%s url=%s", len(tail), start, url)
+        cue_points = _parse_webm_cues(tail, start)
+        log.info("webm probe tail cues url=%s cue_count=%s", url, len(cue_points))
+        probe = _build_webm_probe(init_meta, cue_points, content_length)
+        if probe:
+            log.info("webm probe built from tail cues url=%s segment_count=%s", url, len(probe.get("segments") or []))
+            return probe
+        log.warning(
+            "webm probe tail path returned none url=%s content_length=%s tail_start=%s cue_count=%s",
+            url,
+            content_length,
+            start,
+            len(cue_points),
+        )
+    else:
+        log.warning(
+            "webm probe skipped tail fetch url=%s content_length=%s tail_probe_bytes=%s",
+            url,
+            content_length,
+            tail_probe_bytes,
+        )
+
+    log.warning("webm probe returning none url=%s", url)
+    return None
 
 
 def _representation_to_dom(
@@ -437,13 +879,13 @@ def _representation_to_dom(
     audio_lang: str | None = None,
     segment_probe: dict[str, Any] | None = None,
 ) -> None:
-    vcodec = str(fmt.get("vcodec") if _is_video_only(fmt) else fmt.get("acodec"))
+    codec = str(fmt.get("vcodec") if _is_video_only(fmt) else fmt.get("acodec"))
     bandwidth = int(_bandwidth(fmt))
 
     repr_node = doc.createElement("Representation")
     repr_node.setAttribute("id", str(fmt["format_id"]))
     repr_node.setAttribute("mimeType", _mime_type(fmt))
-    repr_node.setAttribute("codecs", vcodec)
+    repr_node.setAttribute("codecs", codec)
     repr_node.setAttribute("bandwidth", str(bandwidth))
     repr_node.setAttribute("startWithSAP", "1")
     if fmt.get("width"):
@@ -460,13 +902,27 @@ def _representation_to_dom(
     base_url_node.appendChild(doc.createTextNode(fmt["url"]))
     repr_node.appendChild(base_url_node)
 
+    webm_segments = segment_probe.get("segments") if segment_probe and segment_probe.get("container") == "webm" else None
     sidx_info = segment_probe.get("sidx") if segment_probe else None
-    if sidx_info and sidx_info.get("segments"):
+    if webm_segments:
+        segment_list_node = doc.createElement("SegmentList")
+        if segment_probe and segment_probe.get("timescale"):
+            segment_list_node.setAttribute("timescale", str(segment_probe["timescale"]))
+        if segment_probe and segment_probe.get("init_range"):
+            init_node = doc.createElement("Initialization")
+            init_node.setAttribute("range", segment_probe["init_range"])
+            segment_list_node.appendChild(init_node)
+        for seg in webm_segments:
+            seg_url_node = doc.createElement("SegmentURL")
+            seg_url_node.setAttribute("mediaRange", f"{seg['range_start']}-{seg['range_end']}")
+            segment_list_node.appendChild(seg_url_node)
+        repr_node.appendChild(segment_list_node)
+    elif sidx_info and sidx_info.get("segments"):
         segment_list_node = doc.createElement("SegmentList")
         segment_list_node.setAttribute("timescale", str(sidx_info["timescale"]))
         if segment_probe and segment_probe.get("duration"):
             duration_seconds = float(segment_probe["duration"])
-            total_ticks = max(1, int(round(duration_seconds * int(sidx_info["timescale"])) ))
+            total_ticks = max(1, int(round(duration_seconds * int(sidx_info["timescale"]))))
             avg_ticks = max(1, int(round(total_ticks / len(sidx_info["segments"]))))
             segment_list_node.setAttribute("duration", str(avg_ticks))
         if segment_probe and segment_probe.get("init_range"):
@@ -605,15 +1061,29 @@ async def _resolve_info(request: web.Request) -> tuple[dict[str, Any], str]:
 
 async def info_handler(request: web.Request) -> web.Response:
     info, video_id = await _resolve_info(request)
-    selected = _choose_av_pair(info)
+    selected = _choose_av_pair(
+        info,
+        video_selector=request.query.get("video"),
+        audio_selector=request.query.get("audio"),
+        video_format_id=request.query.get("video_format_id"),
+        audio_format_id=request.query.get("audio_format_id"),
+    )
     probes = await _probe_selected_formats(selected, video_id)
     subtitles = _pick_vtt_subtitles(info)
+    available = _list_selectable_formats(info)
+    query = dict(request.query)
     return web.json_response(
         {
             "title": info.get("title"),
             "duration": info.get("duration"),
             "video_id": info.get("id"),
             "selected_family": selected["family"],
+            "selected_query": {
+                "video": query.get("video", "avc"),
+                "audio": query.get("audio", "aac"),
+                "video_format_id": query.get("video_format_id"),
+                "audio_format_id": query.get("audio_format_id"),
+            },
             "video": {
                 key: selected["video"].get(key)
                 for key in ("format_id", "ext", "vcodec", "width", "height", "fps", "tbr", "filesize", "url")
@@ -621,6 +1091,13 @@ async def info_handler(request: web.Request) -> web.Response:
             "audio": {
                 key: selected["audio"].get(key)
                 for key in ("format_id", "ext", "acodec", "asr", "audio_channels", "tbr", "filesize", "language", "url")
+            },
+            "available_formats": available,
+            "query_params": {
+                "video": ["avc", "vp9", "av1"],
+                "audio": ["aac", "opus"],
+                "video_format_id": "exact yt-dlp video-only format_id override",
+                "audio_format_id": "exact yt-dlp audio-only format_id override",
             },
             "subtitles": subtitles,
             "probes": probes,
@@ -630,12 +1107,20 @@ async def info_handler(request: web.Request) -> web.Response:
 
 
 async def manifest_handler(request: web.Request) -> web.Response:
-    log.info("GET /manifest %s", request.query.get("url"))
+    log.info("GET /manifest %s %s %s", request.query.get("url"), request.query.get("video"),request.query.get("audio"))
     try:
         info, video_id = await _resolve_info(request)
-        selected = _choose_av_pair(info)
+        selected = _choose_av_pair(
+            info,
+            video_selector=request.query.get("video"),
+            audio_selector=request.query.get("audio"),
+            video_format_id=request.query.get("video_format_id"),
+            audio_format_id=request.query.get("audio_format_id"),
+        )
         probes = await _probe_selected_formats(selected, video_id)
         mpd = build_mpd(info, selected, probes)
+    except web.HTTPException:
+        raise
     except RuntimeError as e:
         log.error("manifest error: %s", e)
         return web.Response(text=str(e), status=502)
